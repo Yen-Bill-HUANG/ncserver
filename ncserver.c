@@ -1,22 +1,12 @@
 /*
- * Copyright (c) 2012 The Native Client Authors. All rights reserved.
- * Use of this source code is governed by a BSD-style license that can be
- * found in the LICENSE file.
- */
-
-/*
- * This test program creates two NaCl sandboxes within the same host process.
+ * This test program integrates a web server into the host process and places the HTML parser into a NaCl sandbox.
  */
 
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-
-#include "native_client/src/shared/platform/conf.h"
-#include "native_client/src/shared/platform/macro.h"
-#include "native_client/src/shared/platform/ncwebserver.h"
-#include "native_client/src/shared/platform/usage.h"
+#include <assert.h>
 
 #include "native_client/src/include/build_config.h"
 #include "native_client/src/shared/platform/nacl_check.h"
@@ -30,9 +20,17 @@
 #include "native_client/src/trusted/service_runtime/nacl_valgrind_hooks.h"
 #include "native_client/src/trusted/service_runtime/sel_ldr.h"
 
-//#define SEND_DESC 3
-//#define RECEIVE_DESC 3
+// IMC communication between server and sandboxed HTML parser
+#include "native_client/src/public/imc_types.h"
+#include "native_client/src/public/imc_syscalls.h"
 
+// our web server files
+#include "native_client/src/shared/platform/conf.h"
+#include "native_client/src/shared/platform/macro.h"
+#include "native_client/src/shared/platform/ncwebserver.h"
+#include "native_client/src/shared/platform/usage.h"
+
+#define SEND_DESC 3
 
 const char ncwebserver_usage_string[] = 
     "<executable file> [-h] [-d web-root] [-b bind-address] [-p port]";
@@ -72,13 +70,14 @@ parse_argv(int argc, char **argv, struct ncwebserver_conf_t *conf)
 
 int main(int argc, char **argv) {
   
-  struct NaClApp app[2];
+  struct NaClApp app;
   struct NaClDesc *nd;
-  //NaClHandle handle_pair[2];
-  int i;
-  char *domain1_args[] = {"prog", "domain1", "index.html"};
-  //char *domain2_args[] = {"prog", "domain2"};
-  //int return_code;
+  NaClHandle handle_pair[2];
+  char *parse_args[] = {"prog", "parse"};
+  int return_code;
+  char buffer[100];
+  NaClMessageHeader header;
+  NaClIOVec vec;
 
   struct ncwebserver_t server;
   struct ncwebserver_conf_t conf;
@@ -88,61 +87,55 @@ int main(int argc, char **argv) {
   }
 
   NaClAllModulesInit();
-
   NaClFileNameForValgrind(argv[1]);
   nd = (struct NaClDesc *) NaClDescIoDescOpen(argv[1], NACL_ABI_O_RDONLY, 0);
   CHECK(NULL != nd);
-
-  for (i = 0; i < 1; i++) {
-    CHECK(NaClAppCtor(&app[i]));
-
-    /* Use a smaller guest address space size, because 32-bit Windows
-       does not let us allocate 2GB of address space.  We don't do this
-       for x86-64 because there is an assertion in NaClAllocateSpace()
-       that requires 4GB. */
+  CHECK(NaClAppCtor(&app));
+  /* Use a smaller guest address space size, because 32-bit Windows
+     does not let us allocate 2GB of address space.  We don't do this
+     for x86-64 because there is an assertion in NaClAllocateSpace()
+     that requires 4GB. */
 #if NACL_ARCH(NACL_BUILD_ARCH) == NACL_x86 && NACL_BUILD_SUBARCH == 32
-    app[i].addr_bits = 29; /* 512MB per process */
+  app.addr_bits = 29; /* 512MB per process */
 #endif
-
-    /*
-     * On x86-32, we cannot enable ASLR even when the address space is
-     * 512MB.  In particular, when on Windows where the available
-     * contiguous address space is tight, if the random choice for the
-     * base of the first 512MB address space puts that address space
-     * in the middle of the available address space region, the
-     * address space allocation code might not be able to (randomly)
-     * find another contiguous 512MB region for the second NaCl
-     * module.
-     */
-    CHECK(NaClAppLoadFileAslr(nd, &app[i],
-                              NACL_DISABLE_ASLR) == LOAD_OK);
-    NaClAppInitialDescriptorHookup(&app[i]);
-    CHECK(NaClAppPrepareToLaunch(&app[i]) == LOAD_OK);
-  }
-
-  /* Set up an IMC connection between the two guests.  This allows us
-     to test communications between the two and also synchronise the
-     output for the purpose of checking against the golden file. */
-
-   
-
-  //CHECK(NaClSocketPair(handle_pair) == 0);
-  //NaClAddImcHandle(&app[0], handle_pair[0], SEND_DESC);
-  //NaClAddImcHandle(&app[1], handle_pair[1], RECEIVE_DESC);
-
-  CHECK(NaClCreateMainThread(&app[0], 2, domain1_args, NULL));
-  /*CHECK(NaClCreateMainThread(&app[1], 2, domain2_args, NULL));
-
-  return_code = NaClWaitForMainThreadToExit(&app[0]);
+  /*
+   * On x86-32, we cannot enable ASLR even when the address space is
+   * 512MB.  In particular, when on Windows where the available
+   * contiguous address space is tight, if the random choice for the
+   * base of the first 512MB address space puts that address space
+   * in the middle of the available address space region, the
+   * address space allocation code might not be able to (randomly)
+   * find another contiguous 512MB region for the second NaCl
+   * module.
+   */
+  CHECK(NaClAppLoadFileAslr(nd, &app,
+                            NACL_DISABLE_ASLR) == LOAD_OK);
+  NaClAppInitialDescriptorHookup(&app);
+  CHECK(NaClAppPrepareToLaunch(&app) == LOAD_OK);
+  /* Set up an IMC connection between the host and guest. */
+  CHECK(NaClSocketPair(handle_pair) == 0);
+  NaClAddImcHandle(&app, handle_pair[0], SEND_DESC);
+  CHECK(NaClCreateMainThread(&app, 2, parse_args, NULL));
+  return_code = NaClWaitForMainThreadToExit(&app);
   CHECK(return_code == 101);
-  return_code = NaClWaitForMainThreadToExit(&app[1]);
-  CHECK(return_code == 102);*/
 
+  // receive message sent from HTML parser
+  vec.base = buffer;
+  vec.length = sizeof buffer;
+  memset(buffer, 0, sizeof buffer);
+  header.iov = &vec;
+  header.iov_length = 1;
+  header.handles = NULL;
+  header.handle_count = 0;
+  return_code = NaClReceiveDatagram(handle_pair[1], &header, 0);
+  assert(return_code == sizeof buffer);
+  printf("Server received \"%s\" (with size = %d)\n", buffer+16, return_code);
+
+  // run web server
   memset(&conf, 0, sizeof(conf));
   parse_argv(argc, argv, &conf);
-
   ncwebserver_init(&server, &conf);
-  ncwebserver_start(&server); 
+  ncwebserver_start(&server);
 
   /*
    * Avoid calling exit() because it runs process-global destructors
